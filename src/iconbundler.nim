@@ -413,7 +413,10 @@ proc buildIcns(src: Image; icnsPath: string) =
 proc installMacos(appId, execPath, name, comment, bundleId,
                   outArg: string; src: Image) =
   let bundlePath =
-    if outArg.len > 0: expandFilename(outArg)
+    # Made absolute without asking the file system anything: this is where the
+    # bundle is about to be built, so it is the one path here that is expected
+    # *not* to exist yet, and `expandFilename` would refuse it.
+    if outArg.len > 0: absolutePath(expandTilde(outArg))
     else: getHomeDir() / "Applications" / (name & ".app")
   if not bundlePath.endsWith(".app"):
     quit("--out must end in .app, got: " & bundlePath)
