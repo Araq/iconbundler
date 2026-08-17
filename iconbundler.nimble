@@ -11,6 +11,7 @@ bin           = @["iconbundler"]
 # Dependencies
 
 requires "nim >= 2.0.0"
+requires "pixie >= 6.0.0"   # decoding, resizing and PNG, so that nothing else has to be installed
 
 task test, "Runs the test suite":
   exec "nim c -r tests/preparetest.nim"
