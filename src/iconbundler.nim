@@ -9,11 +9,12 @@
 ## will not connect the two. The PNG defaults to `<app-id>-icon.png` and then
 ## `<app-id>.png` in the current directory.
 ##
-## Image conversions call ImageMagick (`magick`, else `convert` off Windows).
-## If that is missing, a `python3` that can `import PIL` is accepted. Windows
-## `.res` needs `windres` (MinGW, including `x86_64-w64-mingw32-windres`).
-## macOS `.icns` needs `sips` and `iconutil`. Stamping a built `.exe` uses
-## `rcedit` when it is on PATH.
+## Decoding, resizing, PNG and ICO are pixie's and happen in this process, so
+## nothing has to be installed to derive the icons. What is left are the three
+## jobs that are somebody else's format: `windres` (MinGW, including
+## `x86_64-w64-mingw32-windres`) compiles the `.rc` into a `.res`, `iconutil`
+## turns an `.iconset` into an `.icns` on macOS, and `rcedit` stamps an icon
+## into an already-built `.exe` if it is on PATH.
 ##
 ## `--prepare` only writes derived files next to the PNG:
 ##   <stem>.netwm   X11 `_NET_WM_ICON` blob (`staticRead` this from the app)
@@ -35,7 +36,8 @@
 ##   --bundle-id <id>          macOS CFBundleIdentifier (default: org.<app-id>)
 ##   --out <path>              macOS bundle (default: ~/Applications/<Name>.app)
 
-import std/[os, osproc, streams, strutils, strformat, tempfiles]
+import std/[os, osproc, streams, strutils]
+import pixie
 
 # ---------------------------------------------------------------------------
 # The tools this borrows from the machine, looked up once
@@ -43,16 +45,16 @@ import std/[os, osproc, streams, strutils, strformat, tempfiles]
 
 type
   Tools = object
-    magick: string      ## ImageMagick: the first choice for every conversion
-    python: string      ## a python3 that has Pillow: the fallback for all of them
+    ## Only what cannot be done in this process. The picture work -- decoding,
+    ## resizing, PNG, ICO -- is pixie's, so nothing has to be installed for
+    ## `--prepare` to work on a build machine.
     windres: string     ## MinGW resource compiler, for the Windows `.res`
     rcedit: string      ## stamps an icon into an already-built `.exe`
-    sips, iconutil: string  ## macOS, for the `.icns`
+    iconutil: string    ## macOS, for turning an `.iconset` into an `.icns`
 
 var tools: Tools
   ## Filled in by `detectTools` before any work starts. A global because PATH
-  ## does not change while this program runs, and because a conversion would
-  ## otherwise scan it again for every single size.
+  ## does not change while this program runs.
 
 proc run(exe: string; args: openArray[string];
          workingDir = ""): tuple[output: string, code: int] =
@@ -76,97 +78,42 @@ proc findOnPath(names: varargs[string]): string =
     if result.len > 0: return
   result = ""
 
-proc pythonWithPillow(): string =
-  ## A python3 is only of use here if it can `import PIL`. One that cannot is
-  ## no better than no python at all, and finding that out now is what turns a
-  ## traceback halfway through into a sentence before anything is written.
-  for n in ["python3", "python"]:
-    let exe = findExe(n)
-    if exe.len > 0 and run(exe, ["-c", "import PIL"]).code == 0:
-      return exe
-  result = ""
-
 proc detectTools() =
-  # ImageMagick 7 is `magick`. IM6 is `convert`, but on Windows that name is
-  # the filesystem converter -- never use it there.
-  tools.magick =
-    when defined(windows): findOnPath("magick")
-    else: findOnPath("magick", "convert")
-  if tools.magick.len == 0:
-    tools.python = pythonWithPillow()
   tools.windres = findOnPath("windres", "x86_64-w64-mingw32-windres",
                              "i686-w64-mingw32-windres", "llvm-windres")
   tools.rcedit = findOnPath("rcedit", "rcedit.exe", "rcedit-x64",
                             "rcedit-x64.exe")
-  tools.sips = findOnPath("sips")
   tools.iconutil = findOnPath("iconutil")
 
-proc requireImageTool() =
-  if tools.magick.len == 0 and tools.python.len == 0:
-    quit("need ImageMagick (`magick`) or a python3 that can `import PIL`")
-
-template withTempDir(dir, body: untyped) =
-  ## `dir` is the temporary directory inside `body`, and is gone after it.
-  block:
-    let dir = createTempDir("iconbundler_", "")
-    try:
-      body
-    finally:
-      removeDir(dir)
-
 # ---------------------------------------------------------------------------
-# PNG conversions (ImageMagick, else Pillow)
+# The picture work, all of it in this process
 # ---------------------------------------------------------------------------
 
-proc pyStr(s: string): string =
-  ## `s` as a Python string literal. Escaped rather than the `r'''…'''` that
-  ## suggests itself: a raw literal cannot hold a run of three quotes and
-  ## cannot end in a backslash, and a path is free to do both.
-  result = newStringOfCap(s.len + 2)
-  result.add '\''
-  for c in s:
-    if c in {'\\', '\''}: result.add '\\'
-    result.add c
-  result.add '\''
-
-proc runPython(script: string) =
-  ## The script goes through a file rather than `python -c`: quoting a
-  ## multi-line program differs from shell to shell, a file name does not.
-  if tools.python.len == 0: quit("python3 with Pillow not found")
-  let (f, path) = createTempFile("iconbundler_", ".py")
+proc loadSource(path: string): Image =
   try:
-    f.write script
-  finally:
-    f.close()
-  try:
-    runOrQuit(tools.python, [path])
-  finally:
-    removeFile(path)
+    result = readImage(path)
+  except PixieError:
+    quit("cannot read " & path & ": " & getCurrentExceptionMsg())
+  if result.width < 1 or result.height < 1:
+    quit("empty image: " & path)
 
-proc pillowResized(src: string; px: int): string =
-  ## The head every Pillow script here shares: the source, resized to `px`.
-  &"""
-from PIL import Image
-im = Image.open({pyStr(src)}).convert('RGBA')
-im = im.resize(({px}, {px}), Image.Resampling.LANCZOS)
-"""
+proc scaled(src: Image; px: int): Image =
+  ## `px` by `px`, however far that is from the source. pixie's draw halves
+  ## the image while it is more than twice the target and interpolates only
+  ## the last step, so 1024 reaches 16 through box filters rather than by
+  ## point-sampling every 64th pixel.
+  if src.width == px and src.height == px: src else: src.resize(px, px)
 
-proc resizePng(src, dst: string; px: int) =
+proc writePng(src: Image; dst: string; px: int) =
   createDir(dst.parentDir)
-  if tools.magick.len > 0:
-    runOrQuit(tools.magick,
-              [src, "-alpha", "on", "-resize", &"{px}x{px}!", dst])
-  else:
-    runPython(pillowResized(src, px) & &"im.save({pyStr(dst)})" & "\n")
+  try:
+    src.scaled(px).writeFile(dst)
+  except PixieError:
+    quit("cannot write " & dst & ": " & getCurrentExceptionMsg())
 
-proc writeRgbaRaw(src, dst: string; px: int) =
-  ## `px`×`px` raw RGBA (4 bytes/pixel, no header).
-  if tools.magick.len > 0:
-    runOrQuit(tools.magick, [src, "-alpha", "on", "-resize", &"{px}x{px}!",
-                             "-depth", "8", "rgba:" & dst])
-  else:
-    runPython(pillowResized(src, px) &
-              &"open({pyStr(dst)}, 'wb').write(im.tobytes())" & "\n")
+proc addU16LE(s: var string; v: uint16) =
+  s.add char(v and 0xff)
+  s.add char((v shr 8) and 0xff)
 
 proc addU32LE(s: var string; v: uint32) =
   s.add char(v and 0xff)
@@ -174,51 +121,105 @@ proc addU32LE(s: var string; v: uint32) =
   s.add char((v shr 16) and 0xff)
   s.add char((v shr 24) and 0xff)
 
-proc writeNetWm(png, dest: string) =
+proc writeNetWm(src: Image; dest: string) =
   ## `_NET_WM_ICON`: for each size, CARD32 width, height, then width*height
-  ## pixels as 0xAARRGGBB. ImageMagick and Pillow both hand over RGBA. The app
-  ## copies the blob into CARD32s as it is, so what is written here is the
-  ## little-endian order the machines that read it back use.
+  ## pixels as 0xAARRGGBB. The app copies the blob into CARD32s as it is, so
+  ## what is written here is the little-endian order the machines that read it
+  ## back use. `rgba()` unpremultiplies -- pixie keeps its pixels premultiplied
+  ## and the property is not.
   const sizes = [32, 64, 128]
   var total = 0
   for px in sizes: total += 8 + px * px * 4
   var blob = newStringOfCap(total)
-  withTempDir dir:
-    for px in sizes:
-      let rawPath = dir / ($px & ".rgba")
-      writeRgbaRaw(png, rawPath, px)
-      let raw = readFile(rawPath)
-      let want = px * px * 4
-      if raw.len != want:
-        quit(&"expected {want} RGBA bytes at {px}px, got {raw.len}")
-      blob.addU32LE uint32(px)
-      blob.addU32LE uint32(px)
-      var i = 0
-      while i < raw.len:
-        blob.addU32LE (uint32(raw[i+3].uint8) shl 24) or
-                      (uint32(raw[i].uint8) shl 16) or
-                      (uint32(raw[i+1].uint8) shl 8) or
-                       uint32(raw[i+2].uint8)
-        inc i, 4
+  for px in sizes:
+    let img = src.scaled(px)
+    blob.addU32LE uint32(px)
+    blob.addU32LE uint32(px)
+    for c in img.data:
+      let s = c.rgba()
+      blob.addU32LE (uint32(s.a) shl 24) or (uint32(s.r) shl 16) or
+                    (uint32(s.g) shl 8) or uint32(s.b)
   writeFile(dest, blob)
   echo "netwm -> ", dest
 
-proc writeIco(png, dest: string) =
-  ## One file holding 16, 32, 48, 64, 128 and 256 pixel frames; both tools are
-  ## told that set, only in their own spelling of it.
+const
+  IcoSizes = [16, 32, 48, 64, 128, 256]
+  IcoPngFrom = 128
+    ## From this size up a frame goes in as a PNG, below it as a DIB. Windows
+    ## has read PNG frames since Vista and they are a fraction of the size,
+    ## but the small ones are what an older shell reaches for, so those stay
+    ## in the format that has always worked.
+
+proc dibFrame(img: Image): string =
+  ## A frame in the shape an `.ico` inherited from the bitmap format: a
+  ## BITMAPINFOHEADER whose height counts the mask as well, the pixels bottom
+  ## up as BGRA, and then the 1bpp AND mask. What draws a 32-bit frame reads
+  ## the alpha channel and ignores that mask, but what does not read alpha has
+  ## only the mask to go on -- so it is made to say the same thing, one bit per
+  ## pixel, set where the picture is see-through.
+  let
+    w = img.width
+    h = img.height
+    maskRow = ((w + 31) div 32) * 4
+  result = newStringOfCap(40 + w * h * 4 + maskRow * h)
+  result.addU32LE 40'u32           # header size
+  result.addU32LE uint32(w)
+  result.addU32LE uint32(h * 2)    # pixels and mask
+  result.addU16LE 1'u16            # planes
+  result.addU16LE 32'u16           # bits per pixel
+  result.addU32LE 0'u32            # BI_RGB, no compression
+  result.addU32LE uint32(w * h * 4 + maskRow * h)
+  result.addU32LE 0'u32            # pixels per meter, x and y
+  result.addU32LE 0'u32
+  result.addU32LE 0'u32            # colors used, colors important
+  result.addU32LE 0'u32
+  for y in countdown(h - 1, 0):
+    for x in 0 ..< w:
+      let c = img.data[y * w + x].rgba()
+      result.add char(c.b)
+      result.add char(c.g)
+      result.add char(c.r)
+      result.add char(c.a)
+  for y in countdown(h - 1, 0):
+    var row = newString(maskRow)          # the padding stays zero: opaque
+    for x in 0 ..< w:
+      if img.data[y * w + x].rgba().a < 128:
+        # The top bit of a byte is its leftmost pixel.
+        row[x div 8] = char(row[x div 8].uint8 or (0x80'u8 shr (x mod 8)))
+    result.add row
+
+proc writeIco(src: Image; dest: string) =
+  ## One file holding a frame at each of `IcoSizes`. An `.ico` is a directory
+  ## of independent pictures, so the small ones are not scaled from the big
+  ## one at display time -- which is the whole reason to ship six of them.
   createDir(dest.parentDir)
-  if tools.magick.len > 0:
-    runOrQuit(tools.magick, [png, "-background", "none", "-define",
-                             "icon:auto-resize=256,128,64,48,32,16", dest])
-  else:
-    runPython(&"""
-from PIL import Image
-src = Image.open({pyStr(png)}).convert('RGBA')
-sizes = [16, 32, 48, 64, 128, 256]
-imgs = [src.resize((s, s), Image.Resampling.LANCZOS) for s in sizes]
-imgs[-1].save({pyStr(dest)}, format='ICO', sizes=[(s, s) for s in sizes],
-              append_images=imgs[:-1])
-""")
+  var frames: seq[string] = @[]
+  for px in IcoSizes:
+    let img = src.scaled(px)
+    frames.add(
+      if px >= IcoPngFrom:
+        try: img.encodeImage(PngFormat)
+        except PixieError: quit("cannot encode " & $px & "px frame: " &
+                                getCurrentExceptionMsg())
+      else: dibFrame(img))
+  var ico = ""
+  ico.addU16LE 0'u16                     # reserved
+  ico.addU16LE 1'u16                     # 1 = icon, 2 = cursor
+  ico.addU16LE uint16(IcoSizes.len)
+  var offset = 6 + 16 * IcoSizes.len
+  for i, px in IcoSizes:
+    # 256 does not fit in the byte, and is written as 0 -- the one number the
+    # format spells differently from every other.
+    ico.add char(if px >= 256: 0 else: px)
+    ico.add char(if px >= 256: 0 else: px)
+    ico.add '\0'                         # colors in the palette: none
+    ico.add '\0'                         # reserved
+    ico.addU16LE 1'u16                   # planes
+    ico.addU16LE 32'u16                  # bits per pixel
+    ico.addU32LE uint32(frames[i].len)
+    ico.addU32LE uint32(offset)
+    offset += frames[i].len
+  writeFile(dest, ico & frames.join())
   echo "ico -> ", dest
 
 proc writeRes(ico, rc, res, appId: string) =
@@ -268,14 +269,13 @@ proc resolveExec(arg: string): string =
   if result.len == 0:
     quit("cannot find executable: " & arg)
 
-proc prepareFromPng(appId, png: string): string =
+proc prepareFromPng(appId, png: string; src: Image): string =
   ## Everything that is derived from the PNG, written next to it. Returns the
   ## `.ico`, which is the one an installation may still have a use for.
-  requireImageTool()
   let dir = png.parentDir
-  writeNetWm(png, dir / (png.splitFile.name & ".netwm"))
+  writeNetWm(src, dir / (png.splitFile.name & ".netwm"))
   result = dir / (appId & ".ico")
-  writeIco(png, result)
+  writeIco(src, result)
   writeRes(result, dir / (appId & ".rc"), dir / (appId & ".res"), appId)
 
 # ---------------------------------------------------------------------------
@@ -313,12 +313,12 @@ proc writeDesktop(appId, execPath, name, genericName, comment,
   writeFile(desktopPath, body)
   echo "desktop -> ", desktopPath, " (Exec=", execPath, ")"
 
-proc installLinux(appId, execPath, png, name, genericName, comment,
-                  categories: string) =
+proc installLinux(appId, execPath, name, genericName, comment,
+                  categories: string; src: Image) =
   let icons = xdgDataHome() / "icons" / "hicolor"
   for px in [32, 48, 64, 128, 256]:
     let target = icons / ($px & "x" & $px) / "apps" / (appId & ".png")
-    resizePng(png, target, px)
+    writePng(src, target, px)
     echo "  ", target
   writeDesktop(appId, execPath, name, genericName, comment, categories)
   # Refreshing the caches is what makes the entry show up now rather than after
@@ -383,7 +383,7 @@ proc writeInfoPlist(path, name, execName, bundleId, comment: string) =
   s.add "</dict>\n</plist>\n"
   writeFile(path, s)
 
-proc buildIcns(pngPath, icnsPath: string) =
+proc buildIcns(src: Image; icnsPath: string) =
   let iconset = icnsPath & ".iconset"
   removeDir(iconset)
   createDir(iconset)
@@ -404,18 +404,14 @@ proc buildIcns(pngPath, icnsPath: string) =
     (1024, "icon_512x512@2x.png"),
   ]
   for (px, fname) in entries:
-    let outPng = iconset / fname
-    if tools.sips.len > 0:
-      runOrQuit(tools.sips, ["-z", $px, $px, pngPath, "--out", outPng])
-    else:
-      resizePng(pngPath, outPng, px)
+    writePng(src, iconset / fname, px)
   if tools.iconutil.len == 0:
     quit("iconutil not found (comes with Xcode / the command line tools)")
   runOrQuit(tools.iconutil, ["-c", "icns", iconset, "-o", icnsPath])
   removeDir(iconset)
 
-proc installMacos(appId, execPath, png, name, comment, bundleId,
-                  outArg: string) =
+proc installMacos(appId, execPath, name, comment, bundleId,
+                  outArg: string; src: Image) =
   let bundlePath =
     if outArg.len > 0: expandFilename(outArg)
     else: getHomeDir() / "Applications" / (name & ".app")
@@ -434,7 +430,7 @@ proc installMacos(appId, execPath, png, name, comment, bundleId,
   echo "binary -> ", destBin
 
   let icnsPath = resources / "AppIcon.icns"
-  buildIcns(png, icnsPath)
+  buildIcns(src, icnsPath)
   echo "icon -> ", icnsPath
 
   writeInfoPlist(contents / "Info.plist", name, appId, bundleId, comment)
@@ -523,14 +519,16 @@ proc main =
 
   detectTools()
   let png = sourcePng(appId, iconsArg)
-  let ico = prepareFromPng(appId, png)
+  let src = loadSource(png)
+  let ico = prepareFromPng(appId, png, src)
   if not prepareOnly:
     let execPath = resolveExec(execArg)
     case hostOS
     of "linux":
-      installLinux(appId, execPath, png, name, genericName, comment, categories)
+      installLinux(appId, execPath, name, genericName, comment, categories,
+                   src)
     of "macosx":
-      installMacos(appId, execPath, png, name, comment, bundleId, outArg)
+      installMacos(appId, execPath, name, comment, bundleId, outArg, src)
     of "windows":
       installWindows(execPath, ico)
     else:

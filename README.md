@@ -58,23 +58,40 @@ and `<app-id>.png` are looked for in the current directory.
 
 ## What it needs installed
 
-Resizing is done by **ImageMagick** (`magick`, or `convert` off Windows) and,
-when that is missing, by a **python3 that can `import PIL`** -- which is
-checked for at the start, so a python without Pillow is reported as a sentence
-rather than as a traceback halfway through. One of the two is required;
-everything else is only needed for the platform that uses it:
+Nothing, to derive the icons. Decoding the PNG, resizing it and writing the
+PNG and ICO frames is [pixie](https://github.com/treeform/pixie), which is
+pure Nim and comes in with the package -- so `--prepare` works on a build
+machine that has a Nim compiler and not one thing more.
+
+Downscaling goes through pixie's `resize`, which halves the image while it is
+more than twice the target and interpolates only the last step. A 1024 pixel
+source reaches 16 pixels through box filters rather than by point-sampling
+every 64th pixel, and lands within about 1% of what ImageMagick's Lanczos
+makes of it.
+
+What is left is the work in somebody else's format, each needed only by the
+platform that asks for it:
 
 | | |
 |---|---|
 | `windres` | the `.res`. MinGW, including `x86_64-w64-mingw32-windres` -- a cross build on Linux counts |
-| `sips`, `iconutil` | the macOS `.icns`; both come with the Xcode command line tools |
+| `iconutil` | the macOS `.icns`; comes with the Xcode command line tools |
 | `rcedit` | stamping a built `.exe`; optional, and the `.res` is the better path anyway |
 
 A missing `windres` is a skipped `.res` and a sentence saying so, not a
 failure: the `.rc` is still written, and another machine can compile it.
 
-Every tool is run without a shell, so a path with a space, a quote or a dollar
-sign in it is passed on exactly as it is.
+Those three are run without a shell, so a path with a space, a quote or a
+dollar sign in it is passed on exactly as it is.
+
+## The .ico
+
+An `.ico` is a directory of independent pictures, not one picture the shell
+scales -- which is the whole point of shipping six of them. The frames are
+written the way Windows expects to find them: 16, 32, 48 and 64 as 32-bit
+BGRA bitmaps with the 1bpp mask the format still wants after it, 128 and 256
+as PNG, which Windows has read since Vista and which keeps the file a third
+of the size it would otherwise be.
 
 ## Tests
 
@@ -83,5 +100,5 @@ nimble test
 ```
 
 Derives the artifacts from a 16x16 PNG the test carries itself and checks their
-shape -- the length and headers the systems reading them require. It skips
-itself, rather than failing, on a machine with neither image tool.
+shape -- the length and headers the systems reading them require, and that
+each `.ico` frame is in the format its size is supposed to be in.

@@ -2,12 +2,12 @@
 ## derives -- not that they look right, which no test can say, but that they
 ## have the shape the systems that read them require: the `_NET_WM_ICON` blob
 ## is exactly as long as its three sizes make it and starts with the first
-## one's dimensions, the `.ico` says how many frames it holds, and the `.rc`
-## names the icon beside it.
+## one's dimensions, every `.ico` frame is where its directory entry says and
+## in the format that size is supposed to be in, and the `.rc` names the icon
+## beside it.
 ##
-## The conversion itself needs ImageMagick or a python3 with Pillow, the same
-## as the tool. Without either, there is nothing here to test and the test
-## says so instead of failing.
+## Nothing external is involved: the picture work is pixie's, so this runs on
+## any machine that can build the tool.
 
 import std/[base64, os, osproc, strutils, tempfiles]
 
@@ -30,18 +30,8 @@ proc u32le(s: string; at: int): uint32 =
   uint32(s[at].uint8) or (uint32(s[at+1].uint8) shl 8) or
   (uint32(s[at+2].uint8) shl 16) or (uint32(s[at+3].uint8) shl 24)
 
-proc hasImageTool(): bool =
-  for exe in ["magick", "convert"]:
-    if findExe(exe).len > 0: return true
-  for exe in ["python3", "python"]:
-    let p = findExe(exe)
-    if p.len > 0 and execCmdEx(quoteShell(p) & " -c \"import PIL\"").exitCode == 0:
-      return true
-  result = false
-
-if not hasImageTool():
-  echo "SKIP: no ImageMagick and no python3 with Pillow on this machine"
-  quit 0
+proc u16le(s: string; at: int): int =
+  s[at].uint8.int or (s[at+1].uint8.int shl 8)
 
 let src = "src" / "iconbundler.nim"
 if not fileExists(src):
@@ -79,12 +69,39 @@ block:
 
 echo "ico:"
 block:
+  const
+    Sizes = [16, 32, 48, 64, 128, 256]
+    PngMagic = "\x89PNG\r\n\x1a\n"
   let ico = readFile(work / "demo.ico")
   check("has the icon directory header",
-        ico.len > 6 and ico[0] == '\0' and ico[1] == '\0' and
-        ico[2] == '\1' and ico[3] == '\0')
-  check("holding six frames", ico.u32le(2) shr 16 == 6'u32,
-        $(ico.u32le(2) shr 16))
+        ico.len > 6 and ico.u16le(0) == 0 and ico.u16le(2) == 1)
+  check("holding six frames", ico.u16le(4) == Sizes.len, $ico.u16le(4))
+  var seen: seq[string] = @[]
+  var ok = true
+  for i, px in Sizes:
+    let e = 6 + i * 16
+    # 256 does not fit in a byte and is spelled 0; every other size is itself.
+    let want = if px == 256: 0 else: px
+    if ico[e].uint8.int != want or ico[e+1].uint8.int != want: ok = false
+    let size = ico.u32le(e + 8).int
+    let off = ico.u32le(e + 12).int
+    if off + size > ico.len:
+      ok = false
+      seen.add "past the end"
+      continue
+    let payload = ico[off ..< off + size]
+    if payload.startsWith(PngMagic):
+      seen.add "PNG"
+    else:
+      seen.add "DIB"
+      # The mask doubles the height in the header; a reader that trusts it and
+      # finds the pixels the other way up draws the icon upside down.
+      if payload.u32le(4).int != px or payload.u32le(8).int != px * 2 or
+         payload.u16le(14) != 32:
+        ok = false
+  check("every entry names its own size and points inside the file", ok)
+  check("the small frames are bitmaps, the big ones PNG",
+        seen == @["DIB", "DIB", "DIB", "DIB", "PNG", "PNG"], seen.join(" "))
 
 echo "rc:"
 block:
