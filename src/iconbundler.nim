@@ -153,8 +153,10 @@ const
 proc dibFrame(img: Image): string =
   ## A frame in the shape an `.ico` inherited from the bitmap format: a
   ## BITMAPINFOHEADER whose height counts the mask as well, the pixels bottom
-  ## up as BGRA, and then the 1bpp AND mask -- which 32-bit frames do not need,
-  ## because the alpha channel decides, but which the format still wants there.
+  ## up as BGRA, and then the 1bpp AND mask. What draws a 32-bit frame reads
+  ## the alpha channel and ignores that mask, but what does not read alpha has
+  ## only the mask to go on -- so it is made to say the same thing, one bit per
+  ## pixel, set where the picture is see-through.
   let
     w = img.width
     h = img.height
@@ -178,7 +180,13 @@ proc dibFrame(img: Image): string =
       result.add char(c.g)
       result.add char(c.r)
       result.add char(c.a)
-  for _ in 1 .. maskRow * h: result.add '\0'
+  for y in countdown(h - 1, 0):
+    var row = newString(maskRow)          # the padding stays zero: opaque
+    for x in 0 ..< w:
+      if img.data[y * w + x].rgba().a < 128:
+        # The top bit of a byte is its leftmost pixel.
+        row[x div 8] = char(row[x div 8].uint8 or (0x80'u8 shr (x mod 8)))
+    result.add row
 
 proc writeIco(src: Image; dest: string) =
   ## One file holding a frame at each of `IcoSizes`. An `.ico` is a directory
